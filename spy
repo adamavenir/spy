@@ -1,103 +1,123 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# spy - Monitor active Claude Code and Codex conversations
-# Usage: spy [ls|<n>|--done <n>]
-
 CLAUDE_PROJECTS="$HOME/.claude/projects"
 CODEX_SESSIONS="$HOME/.codex/sessions"
 ACTIVE_WINDOW_SECONDS=60
 
-# Get current directory encoded for Claude projects path
+# --- Session discovery ---
+
 get_claude_project_path() {
     local cwd="${1:-$(pwd)}"
-    # Claude encodes paths by replacing / with -
     echo "$cwd" | sed 's|^/||; s|/|-|g; s|^|-|'
 }
 
-# Find all active Claude Code sessions for current directory
 find_claude_sessions() {
     local cwd="${1:-$(pwd)}"
     local project_path
     project_path=$(get_claude_project_path "$cwd")
     local project_dir="$CLAUDE_PROJECTS/$project_path"
 
-    if [[ ! -d "$project_dir" ]]; then
-        return
-    fi
+    [[ ! -d "$project_dir" ]] && return
 
     local now
     now=$(date +%s)
 
-    # Use ls -t to get files sorted by mtime (most recent first), limit to recent files
     while IFS= read -r file; do
-        [[ -z "$file" ]] && continue
-        [[ ! -f "$file" ]] && continue
-
-        # Get file size (skip empty files)
+        [[ -z "$file" || ! -f "$file" ]] && continue
         local size
         size=$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null)
         [[ "$size" -eq 0 ]] && continue
-
-        # Get last modification time
         local mtime
         mtime=$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null)
         local age=$((now - mtime))
-
         echo "claude|$file|$age|$mtime"
     done < <(ls -t "$project_dir"/*.jsonl 2>/dev/null | head -50)
 }
 
-# Find all active Codex sessions for current directory
 find_codex_sessions() {
     local cwd="${1:-$(pwd)}"
     local now
     now=$(date +%s)
 
-    # Search through all Codex session files
     while IFS= read -r file; do
         [[ -z "$file" ]] && continue
-        # Check if this session is for our directory by looking at the cwd in session_meta
         local session_cwd
         session_cwd=$(head -1 "$file" 2>/dev/null | jq -r '.payload.cwd // empty' 2>/dev/null)
-
-        [[ -z "$session_cwd" ]] && continue
-        [[ "$session_cwd" != "$cwd" ]] && continue
-
-        # Get last modification time
+        [[ -z "$session_cwd" || "$session_cwd" != "$cwd" ]] && continue
         local mtime
         mtime=$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null)
         local age=$((now - mtime))
-
         echo "codex|$file|$age|$mtime"
     done < <(find "$CODEX_SESSIONS" -name "*.jsonl" -type f 2>/dev/null)
 }
 
-# Extract first user message from Claude session
-get_claude_first_message() {
-    local file="$1"
-    jq -r 'select(.type == "user" and (.message.content | type) == "string") | .message.content' "$file" 2>/dev/null | head -1
+get_all_sessions() {
+    local cwd="${1:-$(pwd)}"
+    {
+        find_claude_sessions "$cwd"
+        find_codex_sessions "$cwd"
+    } | sort -t'|' -k4 -rn
 }
 
-# Extract last message from Claude session
-get_claude_last_message() {
-    local file="$1"
-    tail -200 "$file" 2>/dev/null | jq -r 'select((.type == "user" or .type == "assistant") and (.message.content | type) == "string") | .message.content' 2>/dev/null | tail -1
+# Get session by index (1-based, sorted by recency)
+get_session_by_index() {
+    local n="$1"
+    local sessions="$2"
+    echo "$sessions" | sed -n "${n}p"
 }
 
-# Extract first user message from Codex session
-get_codex_first_message() {
-    local file="$1"
-    jq -r 'select(.type == "response_item" and .payload.role == "user") | .payload.content[0].text // empty | select(test("^# AGENTS|^<INSTRUCTIONS|^<environment_context|^<permissions|^<turn_aborted") | not)' "$file" 2>/dev/null | head -1
+count_active_sessions() {
+    local sessions="$1"
+    local count=0
+    while IFS='|' read -r type file age mtime; do
+        [[ -z "$type" ]] && continue
+        [[ $age -le $ACTIVE_WINDOW_SECONDS ]] && ((count++))
+    done <<< "$sessions"
+    echo "$count"
 }
 
-# Extract last message from Codex session
-get_codex_last_message() {
+# --- Text extraction ---
+
+# Extract all parsed text lines from a Claude session
+extract_claude_text() {
     local file="$1"
-    tail -200 "$file" 2>/dev/null | jq -r 'select(.type == "response_item" and (.payload.role == "user" or .payload.role == "assistant")) | .payload.content[0].text // empty' 2>/dev/null | tail -1
+    jq -r '
+        select((.type == "user" or .type == "assistant") and .message != null) |
+        .message |
+        (if .content == null then empty
+         elif (.content | type) == "string" then .content
+         elif (.content | type) == "array" then
+           (.content[] | select(.type == "text") | .text) // empty
+         else empty end) //
+        empty
+    ' "$file" 2>/dev/null
 }
 
-# Format time ago
+# Extract all parsed text lines from a Codex session
+extract_codex_text() {
+    local file="$1"
+    jq -r '
+        select(.type == "response_item" and .payload.role != null) |
+        select(.payload.role == "user" or .payload.role == "assistant") |
+        .payload.content[0].text // empty |
+        select(test("^# AGENTS|^<INSTRUCTIONS|^<environment_context|^<permissions|^<turn_aborted") | not) |
+        select(length > 0)
+    ' "$file" 2>/dev/null
+}
+
+extract_text() {
+    local type="$1"
+    local file="$2"
+    if [[ "$type" == "claude" ]]; then
+        extract_claude_text "$file"
+    else
+        extract_codex_text "$file"
+    fi
+}
+
+# --- Formatting ---
+
 format_time_ago() {
     local seconds="$1"
     if [[ $seconds -lt 60 ]]; then
@@ -111,8 +131,7 @@ format_time_ago() {
     fi
 }
 
-# Truncate text to max length
-truncate() {
+truncate_line() {
     local text="$1"
     local max="${2:-80}"
     if [[ ${#text} -gt $max ]]; then
@@ -122,205 +141,307 @@ truncate() {
     fi
 }
 
-# Get all sessions sorted by recency
-get_all_sessions() {
-    local cwd="${1:-$(pwd)}"
-    {
-        find_claude_sessions "$cwd"
-        find_codex_sessions "$cwd"
-    } | sort -t'|' -k4 -rn
-}
+# --- Views ---
 
-# Display accordion view of a session
-display_session() {
-    local num="$1"
-    local type="$2"
-    local file="$3"
-    local age="$4"
-    local label
+# Accordion: first 3 lines + "..." + last 10 lines
+show_accordion() {
+    local type="$1"
+    local file="$2"
+    local age="$3"
 
-    if [[ "$type" == "claude" ]]; then
-        label="claude"
-    else
-        label="codex"
+    local text
+    text=$(extract_text "$type" "$file")
+
+    if [[ -z "$text" ]]; then
+        echo "(empty session)"
+        return
     fi
 
-    local first_msg last_msg
-    if [[ "$type" == "claude" ]]; then
-        first_msg=$(get_claude_first_message "$file")
-        last_msg=$(get_claude_last_message "$file")
-    else
-        first_msg=$(get_codex_first_message "$file")
-        last_msg=$(get_codex_last_message "$file")
-    fi
-
-    # Clean up messages (remove newlines, extra spaces)
-    first_msg=$(echo "$first_msg" | tr '\n' ' ' | sed 's/  */ /g' | xargs)
-    last_msg=$(echo "$last_msg" | tr '\n' ' ' | sed 's/  */ /g' | xargs)
+    local total_lines
+    total_lines=$(echo "$text" | wc -l | tr -d ' ')
 
     local time_str
     time_str=$(format_time_ago "$age")
 
-    echo "[$num] \"$(truncate "$first_msg" 60)\""
-    echo "... \"$(truncate "$last_msg" 60)\""
-    echo "    $time_str [$label]"
+    if [[ $total_lines -le 13 ]]; then
+        echo "$text"
+    else
+        echo "$text" | head -3
+        echo "..."
+        echo "$text" | tail -10
+    fi
+    echo ""
+    echo "  $time_str [$type] ($total_lines lines)"
+}
+
+# List view: compact summary per session
+show_list_item() {
+    local num="$1"
+    local type="$2"
+    local file="$3"
+    local age="$4"
+
+    local first_line last_line
+    first_line=$(extract_text "$type" "$file" | head -1)
+    last_line=$(tail -200 "$file" 2>/dev/null | if [[ "$type" == "claude" ]]; then
+        jq -r 'select((.type == "user" or .type == "assistant") and .message != null) | .message | (if (.content | type) == "string" then .content elif (.content | type) == "array" then (.content[] | select(.type == "text") | .text) // empty else empty end) // empty' 2>/dev/null | tail -1
+    else
+        jq -r 'select(.type == "response_item" and (.payload.role == "user" or .payload.role == "assistant")) | .payload.content[0].text // empty | select(length > 0)' 2>/dev/null | tail -1
+    fi)
+
+    first_line=$(echo "$first_line" | tr '\n' ' ' | sed 's/  */ /g')
+    last_line=$(echo "$last_line" | tr '\n' ' ' | sed 's/  */ /g')
+
+    local time_str
+    time_str=$(format_time_ago "$age")
+
+    echo "[$num] \"$(truncate_line "$first_line" 60)\""
+    echo "... \"$(truncate_line "$last_line" 60)\""
+    echo "    $time_str [$type]"
     echo ""
 }
 
-# Tail a specific session
-tail_session() {
-    local file="$1"
-    local type="$2"
+# Watch mode: follow a session live
+watch_session() {
+    local type="$1"
+    local file="$2"
 
-    echo "Tailing $type session: $file"
+    echo "Watching $type session (Ctrl-C to stop)"
     echo "---"
 
     if [[ "$type" == "claude" ]]; then
-        tail -f "$file" | while read -r line; do
-            local msg_type msg
-            msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
-            if [[ "$msg_type" == "user" || "$msg_type" == "assistant" ]]; then
-                msg=$(echo "$line" | jq -r '.message // empty' 2>/dev/null)
-                if [[ -n "$msg" ]]; then
-                    echo ""
-                    echo "[$msg_type]"
-                    echo "$msg" | head -20
-                fi
-            fi
-        done
+        tail -f "$file" 2>/dev/null | jq --unbuffered -r '
+            select((.type == "user" or .type == "assistant") and .message != null) |
+            "\n[\(.type)]",
+            (.message |
+                if (.content | type) == "string" then .content
+                elif (.content | type) == "array" then
+                    (.content[] | select(.type == "text") | .text) // empty
+                else empty end) //
+            empty
+        ' 2>/dev/null
     else
-        tail -f "$file" | while read -r line; do
-            local payload_type role msg
-            payload_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
-            if [[ "$payload_type" == "response_item" ]]; then
-                role=$(echo "$line" | jq -r '.payload.role // empty' 2>/dev/null)
-                msg=$(echo "$line" | jq -r '.payload.content[0].text // empty' 2>/dev/null)
-                if [[ -n "$msg" && ("$role" == "user" || "$role" == "assistant") ]]; then
-                    echo ""
-                    echo "[$role]"
-                    echo "$msg" | head -20
-                fi
-            fi
-        done
+        tail -f "$file" 2>/dev/null | jq --unbuffered -r '
+            select(.type == "response_item" and (.payload.role == "user" or .payload.role == "assistant")) |
+            "\n[\(.payload.role)]",
+            (.payload.content[0].text // empty) |
+            select(length > 0)
+        ' 2>/dev/null
     fi
 }
 
-# Main logic
+# --- Argument parsing ---
+
 main() {
-    local cmd="${1:-}"
     local cwd
     cwd=$(pwd)
+    local session_num=""
+    local command=""
+    local count=""
 
-    case "$cmd" in
-        ls|"")
-            # List active and recent sessions
-            local sessions
-            sessions=$(get_all_sessions "$cwd")
-
-            if [[ -z "$sessions" ]]; then
-                echo "No sessions found for $cwd"
-                exit 0
-            fi
-
-            local active_count=0
-            local done_count=0
-            local num=1
-            local done_num=1
-
-            # First pass: show active sessions (within ACTIVE_WINDOW)
-            echo "=== Active ==="
-            echo ""
-            while IFS='|' read -r type file age mtime; do
-                if [[ $age -le $ACTIVE_WINDOW_SECONDS ]]; then
-                    display_session "$num" "$type" "$file" "$age"
-                    ((num++))
-                    ((active_count++))
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            ls)
+                command="ls"
+                shift
+                ;;
+            watch)
+                command="watch"
+                shift
+                ;;
+            tail)
+                command="tail"
+                shift
+                if [[ $# -gt 0 && "$1" =~ ^-?[0-9]+$ ]]; then
+                    count="${1#-}"
+                    shift
                 fi
-            done <<< "$sessions"
-
-            if [[ $active_count -eq 0 ]]; then
-                echo "(none)"
-                echo ""
-            fi
-
-            # Second pass: show recent inactive sessions (up to 5)
-            echo "=== Recent ==="
-            echo ""
-            while IFS='|' read -r type file age mtime; do
-                if [[ $age -gt $ACTIVE_WINDOW_SECONDS && $done_count -lt 5 ]]; then
-                    display_session "$done_num" "$type" "$file" "$age"
-                    ((done_num++))
-                    ((done_count++))
+                ;;
+            head)
+                command="head"
+                shift
+                if [[ $# -gt 0 && "$1" =~ ^-?[0-9]+$ ]]; then
+                    count="${1#-}"
+                    shift
                 fi
-            done <<< "$sessions"
+                ;;
+            -h|--help)
+                command="help"
+                shift
+                ;;
+            [0-9]*)
+                session_num="$1"
+                shift
+                ;;
+            *)
+                echo "Unknown argument: $1"
+                echo "Run 'spy --help' for usage."
+                exit 1
+                ;;
+        esac
+    done
 
-            if [[ $done_count -eq 0 ]]; then
-                echo "(none)"
-                echo ""
-            fi
+    # Resolve sessions
+    local sessions
+    sessions=$(get_all_sessions "$cwd")
+
+    if [[ -z "$sessions" ]]; then
+        echo "No sessions found for $cwd"
+        exit 0
+    fi
+
+    # Execute command
+    case "${command:-default}" in
+        help)
+            show_help
             ;;
-
-        --done)
-            # Show done session by number
-            local n="${2:-1}"
-            local sessions
-            sessions=$(get_all_sessions "$cwd")
-
-            local done_num=0
-            while IFS='|' read -r type file age mtime; do
-                if [[ $age -gt $ACTIVE_WINDOW_SECONDS ]]; then
-                    ((done_num++))
-                    if [[ $done_num -eq $n ]]; then
-                        tail_session "$file" "$type"
-                        exit 0
-                    fi
-                fi
-            done <<< "$sessions"
-
-            echo "No done session #$n found"
-            exit 1
+        ls)
+            cmd_ls "$sessions"
             ;;
-
-        [0-9]*)
-            # Tail active session by number
-            local n="$cmd"
-            local sessions
-            sessions=$(get_all_sessions "$cwd")
-
-            local active_num=0
-            while IFS='|' read -r type file age mtime; do
-                if [[ $age -le $ACTIVE_WINDOW_SECONDS ]]; then
-                    ((active_num++))
-                    if [[ $active_num -eq $n ]]; then
-                        tail_session "$file" "$type"
-                        exit 0
-                    fi
-                fi
-            done <<< "$sessions"
-
-            echo "No active session #$n found"
-            exit 1
+        watch)
+            cmd_watch "$sessions" "$session_num"
             ;;
-
-        -h|--help)
-            echo "spy - Monitor active Claude Code and Codex conversations"
-            echo ""
-            echo "Usage:"
-            echo "  spy             List all sessions (active + recent 5)"
-            echo "  spy ls          Same as above"
-            echo "  spy <n>         Tail active session #n"
-            echo "  spy --done <n>  Tail recently inactive session #n"
-            echo ""
-            echo "Sessions are numbered by recency (1 = most recent)."
-            echo "Active = updated within last ${ACTIVE_WINDOW_SECONDS}s."
+        tail)
+            cmd_tail "$sessions" "$session_num" "${count:-30}"
             ;;
-
-        *)
-            echo "Unknown command: $cmd"
-            echo "Run 'spy --help' for usage."
-            exit 1
+        head)
+            cmd_head "$sessions" "$session_num" "${count:-5}"
+            ;;
+        default)
+            cmd_default "$sessions" "$session_num"
             ;;
     esac
+}
+
+show_help() {
+    cat <<'EOF'
+spy - Monitor active Claude Code and Codex conversations
+
+Usage:
+  spy              Show accordion of most recent session, or list if multiple active
+  spy <n>          Show accordion of session #n
+  spy watch        Follow the most recent session live
+  spy <n> watch    Follow session #n live
+  spy tail -30     Last 30 lines of parsed text from most recent session
+  spy head -5      First 5 lines of parsed text from most recent session
+  spy <n> tail -N  Last N lines from session #n
+  spy <n> head -N  First N lines from session #n
+  spy ls           List active sessions + 5 most recent
+
+Sessions are numbered by recency (1 = most recent).
+Active = updated within last 60s.
+EOF
+}
+
+resolve_session() {
+    local sessions="$1"
+    local session_num="$2"
+    local n="${session_num:-1}"
+    local entry
+    entry=$(get_session_by_index "$n" "$sessions")
+    if [[ -z "$entry" ]]; then
+        echo "No session #$n found" >&2
+        exit 1
+    fi
+    echo "$entry"
+}
+
+cmd_default() {
+    local sessions="$1"
+    local session_num="$2"
+
+    if [[ -n "$session_num" ]]; then
+        # Specific session: show accordion
+        local entry
+        entry=$(resolve_session "$sessions" "$session_num")
+        IFS='|' read -r type file age mtime <<< "$entry"
+        show_accordion "$type" "$file" "$age"
+        return
+    fi
+
+    # Check how many active sessions
+    local active_count
+    active_count=$(count_active_sessions "$sessions")
+
+    if [[ $active_count -gt 1 ]]; then
+        cmd_ls "$sessions"
+    else
+        # Show accordion of most recent session
+        local entry
+        entry=$(get_session_by_index 1 "$sessions")
+        IFS='|' read -r type file age mtime <<< "$entry"
+        show_accordion "$type" "$file" "$age"
+    fi
+}
+
+cmd_ls() {
+    local sessions="$1"
+    local active_count=0
+    local done_count=0
+    local num=1
+    local done_num=1
+
+    echo "=== Active ==="
+    echo ""
+    while IFS='|' read -r type file age mtime; do
+        [[ -z "$type" ]] && continue
+        if [[ $age -le $ACTIVE_WINDOW_SECONDS ]]; then
+            show_list_item "$num" "$type" "$file" "$age"
+            ((num++))
+            ((active_count++))
+        fi
+    done <<< "$sessions"
+
+    if [[ $active_count -eq 0 ]]; then
+        echo "(none)"
+        echo ""
+    fi
+
+    echo "=== Recent ==="
+    echo ""
+    while IFS='|' read -r type file age mtime; do
+        [[ -z "$type" ]] && continue
+        if [[ $age -gt $ACTIVE_WINDOW_SECONDS && $done_count -lt 5 ]]; then
+            show_list_item "$done_num" "$type" "$file" "$age"
+            ((done_num++))
+            ((done_count++))
+        fi
+    done <<< "$sessions"
+
+    if [[ $done_count -eq 0 ]]; then
+        echo "(none)"
+        echo ""
+    fi
+}
+
+cmd_watch() {
+    local sessions="$1"
+    local session_num="$2"
+    local entry
+    entry=$(resolve_session "$sessions" "$session_num")
+    IFS='|' read -r type file age mtime <<< "$entry"
+    watch_session "$type" "$file"
+}
+
+cmd_tail() {
+    local sessions="$1"
+    local session_num="$2"
+    local n="$3"
+    local entry
+    entry=$(resolve_session "$sessions" "$session_num")
+    IFS='|' read -r type file age mtime <<< "$entry"
+    extract_text "$type" "$file" | tail -"$n"
+}
+
+cmd_head() {
+    local sessions="$1"
+    local session_num="$2"
+    local n="$3"
+    local entry
+    entry=$(resolve_session "$sessions" "$session_num")
+    IFS='|' read -r type file age mtime <<< "$entry"
+    extract_text "$type" "$file" | head -"$n"
 }
 
 main "$@"
