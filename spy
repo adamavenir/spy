@@ -5,6 +5,16 @@ CLAUDE_PROJECTS="$HOME/.claude/projects"
 CODEX_SESSIONS="$HOME/.codex/sessions"
 ACTIVE_WINDOW_SECONDS=60
 
+# ANSI styling
+RESET=$'\033[0m'
+DIM=$'\033[2m'
+ITALIC=$'\033[3m'
+DIM_ITALIC=$'\033[2;3m'
+USER_BG=$'\033[48;5;237m'
+CLR_EOL=$'\033[K'
+NO_COLOR="${NO_COLOR:-}"
+USE_COLOR=true
+
 # --- Session discovery ---
 
 get_claude_project_path() {
@@ -32,7 +42,9 @@ find_claude_sessions() {
         mtime=$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null)
         local age=$((now - mtime))
         echo "claude|$file|$age|$mtime"
-    done < <(ls -t "$project_dir"/*.jsonl 2>/dev/null | head -50)
+    done < <(find "$project_dir" -maxdepth 1 -name "*.jsonl" -type f -print0 2>/dev/null \
+        | xargs -0 stat -f '%m %N' 2>/dev/null \
+        | sort -rn | head -50 | cut -d' ' -f2-)
 }
 
 find_codex_sessions() {
@@ -67,6 +79,53 @@ get_session_by_index() {
     echo "$sessions" | sed -n "${n}p"
 }
 
+# Get session by UUID (full or partial match)
+get_session_by_uuid() {
+    local uuid="$1"
+    local cwd="$2"
+
+    # Search Claude sessions
+    local claude_path
+    claude_path=$(get_claude_project_path "$cwd")
+    local claude_dir="$CLAUDE_PROJECTS/$claude_path"
+    if [[ -d "$claude_dir" ]]; then
+        local match
+        match=$(find "$claude_dir" -maxdepth 1 -name "${uuid}*.jsonl" -type f 2>/dev/null | head -1)
+        if [[ -n "$match" && -f "$match" ]]; then
+            local size mtime age now
+            size=$(stat -f %z "$match" 2>/dev/null || stat -c %s "$match" 2>/dev/null)
+            if [[ "$size" -gt 0 ]]; then
+                now=$(date +%s)
+                mtime=$(stat -f %m "$match" 2>/dev/null || stat -c %Y "$match" 2>/dev/null)
+                age=$((now - mtime))
+                echo "claude|$match|$age|$mtime"
+                return
+            fi
+        fi
+    fi
+
+    # Search Codex sessions (UUID is in the filename after the timestamp)
+    local codex_match
+    codex_match=$(find "$CODEX_SESSIONS" -name "*${uuid}*.jsonl" -type f 2>/dev/null | head -1)
+    if [[ -n "$codex_match" && -f "$codex_match" ]]; then
+        local session_cwd
+        session_cwd=$(head -1 "$codex_match" 2>/dev/null | jq -r '.payload.cwd // empty' 2>/dev/null)
+        if [[ "$session_cwd" == "$cwd" ]]; then
+            local now mtime age
+            now=$(date +%s)
+            mtime=$(stat -f %m "$codex_match" 2>/dev/null || stat -c %Y "$codex_match" 2>/dev/null)
+            age=$((now - mtime))
+            echo "codex|$codex_match|$age|$mtime"
+            return
+        fi
+    fi
+}
+
+# Check if string looks like a UUID (or partial UUID)
+is_uuid() {
+    [[ "$1" =~ ^[0-9a-fA-F-]+$ && ${#1} -ge 4 ]]
+}
+
 count_active_sessions() {
     local sessions="$1"
     local count=0
@@ -78,41 +137,113 @@ count_active_sessions() {
 }
 
 # --- Text extraction ---
+# Tagged output: each line prefixed with role tag and tab
+#   U\t  = user text
+#   A\t  = assistant text
+#   T\t  = tool usage
 
-# Extract all parsed text lines from a Claude session
-extract_claude_text() {
+extract_claude_tagged() {
     local file="$1"
     jq -r '
-        select((.type == "user" or .type == "assistant") and .message != null) |
-        .message |
-        (if .content == null then empty
-         elif (.content | type) == "string" then .content
-         elif (.content | type) == "array" then
-           (.content[] | select(.type == "text") | .text) // empty
-         else empty end) //
-        empty
+        select(.type == "user" or .type == "assistant") |
+        select(.message != null) |
+        . as $entry |
+        if ($entry.message.content | type) == "string" then
+            $entry.message.content | split("\n")[] |
+            select(length > 0) |
+            (if $entry.type == "user" then "U\t" else "A\t" end) + .
+        elif ($entry.message.content | type) == "array" then
+            $entry.message.content[] |
+            if .type == "text" and (.text | length) > 0 then
+                .text | split("\n")[] |
+                select(length > 0) |
+                (if $entry.type == "user" then "U\t" else "A\t" end) + .
+            elif .type == "tool_use" then
+                "T\t" + (
+                    if .name == "Edit" then "Edit " + (.input.file_path // "")
+                    elif .name == "Read" then "Read " + (.input.file_path // "")
+                    elif .name == "Write" then "Write " + (.input.file_path // "")
+                    elif .name == "Grep" then "Grep " + (.input.pattern // "")
+                    elif .name == "Glob" then "Glob " + (.input.pattern // "")
+                    elif .name == "Bash" then "Bash: " + (.input.description // .input.command[:60] // "")
+                    elif .name == "Task" then "Task: " + (.input.description // "")
+                    elif .name == "TodoWrite" then "TodoWrite"
+                    elif .name == "WebFetch" then "WebFetch " + (.input.url // "")
+                    elif .name == "WebSearch" then "WebSearch: " + (.input.query // "")
+                    else .name
+                    end
+                )
+            else empty
+            end
+        else empty
+        end
     ' "$file" 2>/dev/null
 }
 
-# Extract all parsed text lines from a Codex session
-extract_codex_text() {
+extract_codex_tagged() {
     local file="$1"
     jq -r '
-        select(.type == "response_item" and .payload.role != null) |
-        select(.payload.role == "user" or .payload.role == "assistant") |
-        .payload.content[0].text // empty |
-        select(test("^# AGENTS|^<INSTRUCTIONS|^<environment_context|^<permissions|^<turn_aborted") | not) |
-        select(length > 0)
+        select(.type == "response_item") |
+        if .payload.type == "message" and (.payload.role == "user" or .payload.role == "assistant") then
+            . as $entry |
+            ($entry.payload.content[0].text // empty) |
+            select(length > 0) |
+            select(test("^# AGENTS|^<INSTRUCTIONS|^<environment_context|^<permissions|^<turn_aborted") | not) |
+            split("\n")[] |
+            select(length > 0) |
+            (if $entry.payload.role == "user" then "U\t" else "A\t" end) + .
+        elif .payload.type == "function_call" then
+            "T\t" + (
+                if .payload.name == "exec_command" then
+                    "Bash: " + ((.payload.arguments | fromjson? | .cmd // "") // "")[:60]
+                elif .payload.name == "apply_patch" then "apply_patch"
+                else .payload.name
+                end
+            )
+        elif .payload.type == "custom_tool_call" then
+            "T\t" + .payload.name
+        else empty
+        end
     ' "$file" 2>/dev/null
 }
 
-extract_text() {
+extract_tagged() {
     local type="$1"
     local file="$2"
     if [[ "$type" == "claude" ]]; then
-        extract_claude_text "$file"
+        extract_claude_tagged "$file"
     else
-        extract_codex_text "$file"
+        extract_codex_tagged "$file"
+    fi
+}
+
+# Apply ANSI styling to tagged lines
+style_lines() {
+    if [[ "$USE_COLOR" == true ]]; then
+        while IFS=$'\t' read -r role text; do
+            case "$role" in
+                U) printf '%s %s%s%s\n' "$USER_BG" "$text" "$CLR_EOL" "$RESET" ;;
+                A) printf '%s\n' "$text" ;;
+                T) printf '%s%s%s\n' "$DIM_ITALIC" "$text" "$RESET" ;;
+            esac
+        done
+    else
+        local current_tag=""
+        while IFS=$'\t' read -r role text; do
+            local tag
+            case "$role" in
+                U) tag="user" ;;
+                A) tag="agent" ;;
+                T) tag="tool" ;;
+            esac
+            if [[ "$tag" != "$current_tag" ]]; then
+                [[ -n "$current_tag" ]] && printf '</%s>\n' "$current_tag"
+                printf '<%s>\n' "$tag"
+                current_tag="$tag"
+            fi
+            printf '%s\n' "$text"
+        done
+        [[ -n "$current_tag" ]] && printf '</%s>\n' "$current_tag"
     fi
 }
 
@@ -149,29 +280,39 @@ show_accordion() {
     local file="$2"
     local age="$3"
 
-    local text
-    text=$(extract_text "$type" "$file")
+    local tagged
+    tagged=$(extract_tagged "$type" "$file")
 
-    if [[ -z "$text" ]]; then
+    if [[ -z "$tagged" ]]; then
         echo "(empty session)"
         return
     fi
 
     local total_lines
-    total_lines=$(echo "$text" | wc -l | tr -d ' ')
+    total_lines=$(echo "$tagged" | wc -l | tr -d ' ')
 
     local time_str
     time_str=$(format_time_ago "$age")
 
     if [[ $total_lines -le 13 ]]; then
-        echo "$text"
+        echo "$tagged" | style_lines
     else
-        echo "$text" | head -3
-        echo "..."
-        echo "$text" | tail -10
+        echo "$tagged" | head -3 | style_lines
+        echo ""
+        if [[ "$USE_COLOR" == true ]]; then
+            printf '%s...%s\n' "$DIM" "$RESET"
+        else
+            echo "..."
+        fi
+        echo ""
+        echo "$tagged" | tail -10 | style_lines
     fi
     echo ""
-    echo "  $time_str [$type] ($total_lines lines)"
+    if [[ "$USE_COLOR" == true ]]; then
+        printf '  %s%s [%s] (%d lines)%s\n' "$DIM" "$time_str" "$type" "$total_lines" "$RESET"
+    else
+        printf '  %s [%s] (%d lines)\n' "$time_str" "$type" "$total_lines"
+    fi
 }
 
 # List view: compact summary per session
@@ -181,53 +322,125 @@ show_list_item() {
     local file="$3"
     local age="$4"
 
-    local first_line last_line
-    first_line=$(extract_text "$type" "$file" | head -1)
-    last_line=$(tail -200 "$file" 2>/dev/null | if [[ "$type" == "claude" ]]; then
-        jq -r 'select((.type == "user" or .type == "assistant") and .message != null) | .message | (if (.content | type) == "string" then .content elif (.content | type) == "array" then (.content[] | select(.type == "text") | .text) // empty else empty end) // empty' 2>/dev/null | tail -1
-    else
-        jq -r 'select(.type == "response_item" and (.payload.role == "user" or .payload.role == "assistant")) | .payload.content[0].text // empty | select(length > 0)' 2>/dev/null | tail -1
-    fi)
+    local tagged
+    tagged=$(extract_tagged "$type" "$file")
 
-    first_line=$(echo "$first_line" | tr '\n' ' ' | sed 's/  */ /g')
-    last_line=$(echo "$last_line" | tr '\n' ' ' | sed 's/  */ /g')
+    local first_tagged last_tagged
+    first_tagged=$(echo "$tagged" | head -1)
+    last_tagged=$(echo "$tagged" | tail -1)
+
+    local first_role first_line last_role last_line
+    first_role="${first_tagged%%	*}"
+    first_line="${first_tagged#*	}"
+    last_role="${last_tagged%%	*}"
+    last_line="${last_tagged#*	}"
+
+    first_line=$(echo "$first_line" | sed 's/  */ /g')
+    last_line=$(echo "$last_line" | sed 's/  */ /g')
 
     local time_str
     time_str=$(format_time_ago "$age")
 
-    echo "[$num] \"$(truncate_line "$first_line" 60)\""
-    echo "... \"$(truncate_line "$last_line" 60)\""
-    echo "    $time_str [$type]"
-    echo ""
+    local trunc_first trunc_last
+    trunc_first=$(truncate_line "$first_line" 60)
+    trunc_last=$(truncate_line "$last_line" 60)
+
+    if [[ "$USE_COLOR" == true ]]; then
+        if [[ "$first_role" == "U" ]]; then
+            printf '%s[%s] "%s"%s%s\n' "$USER_BG" "$num" "$trunc_first" "$CLR_EOL" "$RESET"
+        elif [[ "$first_role" == "T" ]]; then
+            printf '[%s] %s%s%s\n' "$num" "$DIM_ITALIC" "$trunc_first" "$RESET"
+        else
+            printf '[%s] "%s"\n' "$num" "$trunc_first"
+        fi
+
+        if [[ "$last_role" == "U" ]]; then
+            printf '%s... "%s"%s%s\n' "$USER_BG" "$trunc_last" "$CLR_EOL" "$RESET"
+        elif [[ "$last_role" == "T" ]]; then
+            printf '... %s%s%s\n' "$DIM_ITALIC" "$trunc_last" "$RESET"
+        else
+            printf '... "%s"\n' "$trunc_last"
+        fi
+
+        printf '    %s%s [%s]%s\n\n' "$DIM" "$time_str" "$type" "$RESET"
+    else
+        printf '[%s] "%s"\n' "$num" "$trunc_first"
+        printf '... "%s"\n' "$trunc_last"
+        printf '    %s [%s]\n\n' "$time_str" "$type"
+    fi
 }
 
-# Watch mode: follow a session live
+# Watch mode: poll-based file watcher
+# Claude Code and Codex write in batches (not line-by-line streaming),
+# so tail -f misses updates. Instead, poll the file and show new lines.
 watch_session() {
     local type="$1"
     local file="$2"
 
-    echo "Watching $type session (Ctrl-C to stop)"
+    if [[ "$USE_COLOR" == true ]]; then
+        printf '%sWatching %s session · Ctrl-C to stop%s\n' "$DIM" "$type" "$RESET"
+    else
+        echo "Watching $type session · Ctrl-C to stop"
+    fi
     echo "---"
 
-    if [[ "$type" == "claude" ]]; then
-        tail -f "$file" 2>/dev/null | jq --unbuffered -r '
-            select((.type == "user" or .type == "assistant") and .message != null) |
-            "\n[\(.type)]",
-            (.message |
-                if (.content | type) == "string" then .content
-                elif (.content | type) == "array" then
-                    (.content[] | select(.type == "text") | .text) // empty
-                else empty end) //
-            empty
-        ' 2>/dev/null
-    else
-        tail -f "$file" 2>/dev/null | jq --unbuffered -r '
-            select(.type == "response_item" and (.payload.role == "user" or .payload.role == "assistant")) |
-            "\n[\(.payload.role)]",
-            (.payload.content[0].text // empty) |
-            select(length > 0)
-        ' 2>/dev/null
-    fi
+    local prev_lines
+    prev_lines=$(wc -l < "$file" 2>/dev/null | tr -d ' ')
+
+    while true; do
+        local curr_lines
+        curr_lines=$(wc -l < "$file" 2>/dev/null | tr -d ' ')
+
+        if [[ "$curr_lines" -gt "$prev_lines" ]]; then
+            local skip=$((prev_lines))
+            local new=$((curr_lines - prev_lines))
+            # Extract tagged text from only the new lines
+            tail -n +"$((skip + 1))" "$file" 2>/dev/null | head -n "$new" | if [[ "$type" == "claude" ]]; then
+                jq -r '
+                    select(.type == "user" or .type == "assistant") |
+                    select(.message != null) |
+                    . as $entry |
+                    if ($entry.message.content | type) == "string" then
+                        $entry.message.content | split("\n")[] |
+                        select(length > 0) |
+                        (if $entry.type == "user" then "U\t" else "A\t" end) + .
+                    elif ($entry.message.content | type) == "array" then
+                        $entry.message.content[] |
+                        if .type == "text" and (.text | length) > 0 then
+                            .text | split("\n")[] |
+                            select(length > 0) |
+                            (if $entry.type == "user" then "U\t" else "A\t" end) + .
+                        elif .type == "tool_use" then
+                            "T\t" + .name + (if .input.file_path then " " + .input.file_path elif .input.description then ": " + .input.description elif .input.pattern then " " + .input.pattern else "" end)
+                        else empty
+                        end
+                    else empty
+                    end
+                ' 2>/dev/null
+            else
+                jq -r '
+                    select(.type == "response_item") |
+                    if .payload.type == "message" and (.payload.role == "user" or .payload.role == "assistant") then
+                        . as $entry |
+                        ($entry.payload.content[0].text // empty) |
+                        select(length > 0) |
+                        select(test("^# AGENTS|^<INSTRUCTIONS|^<environment_context|^<permissions|^<turn_aborted") | not) |
+                        split("\n")[] |
+                        select(length > 0) |
+                        (if $entry.payload.role == "user" then "U\t" else "A\t" end) + .
+                    elif .payload.type == "function_call" then
+                        "T\t" + (if .payload.name == "exec_command" then "Bash: " + ((.payload.arguments | fromjson? | .cmd // "") // "")[:60] else .payload.name end)
+                    elif .payload.type == "custom_tool_call" then
+                        "T\t" + .payload.name
+                    else empty
+                    end
+                ' 2>/dev/null
+            fi | style_lines
+            prev_lines="$curr_lines"
+        fi
+
+        sleep 1
+    done
 }
 
 # --- Argument parsing ---
@@ -238,6 +451,11 @@ main() {
     local session_num=""
     local command=""
     local count=""
+
+    # Respect NO_COLOR env var (https://no-color.org)
+    if [[ -n "$NO_COLOR" ]]; then
+        USE_COLOR=false
+    fi
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -266,6 +484,10 @@ main() {
                     shift
                 fi
                 ;;
+            --no-color)
+                USE_COLOR=false
+                shift
+                ;;
             -h|--help)
                 command="help"
                 shift
@@ -275,9 +497,15 @@ main() {
                 shift
                 ;;
             *)
-                echo "Unknown argument: $1"
-                echo "Run 'spy --help' for usage."
-                exit 1
+                # Check if it's a UUID before erroring
+                if is_uuid "$1"; then
+                    session_num="$1"
+                    shift
+                else
+                    echo "Unknown argument: $1"
+                    echo "Run 'spy --help' for usage."
+                    exit 1
+                fi
                 ;;
         esac
     done
@@ -321,6 +549,7 @@ spy - Monitor active Claude Code and Codex conversations
 Usage:
   spy              Show accordion of most recent session, or list if multiple active
   spy <n>          Show accordion of session #n
+  spy <uuid>       Show accordion of session by UUID (partial match supported)
   spy watch        Follow the most recent session live
   spy <n> watch    Follow session #n live
   spy tail -30     Last 30 lines of parsed text from most recent session
@@ -328,6 +557,7 @@ Usage:
   spy <n> tail -N  Last N lines from session #n
   spy <n> head -N  First N lines from session #n
   spy ls           List active sessions + 5 most recent
+  spy --no-color   Disable colors, use <user>/<agent>/<tool> XML tags
 
 Sessions are numbered by recency (1 = most recent).
 Active = updated within last 60s.
@@ -336,14 +566,31 @@ EOF
 
 resolve_session() {
     local sessions="$1"
-    local session_num="$2"
-    local n="${session_num:-1}"
+    local selector="$2"
     local entry
-    entry=$(get_session_by_index "$n" "$sessions")
-    if [[ -z "$entry" ]]; then
-        echo "No session #$n found" >&2
+
+    if [[ -z "$selector" ]]; then
+        # Default to most recent
+        entry=$(get_session_by_index 1 "$sessions")
+    elif [[ "$selector" =~ ^[0-9]+$ ]]; then
+        # Numeric index
+        entry=$(get_session_by_index "$selector" "$sessions")
+        if [[ -z "$entry" ]]; then
+            echo "No session #$selector found" >&2
+            exit 1
+        fi
+    elif is_uuid "$selector"; then
+        # UUID lookup
+        entry=$(get_session_by_uuid "$selector" "$(pwd)")
+        if [[ -z "$entry" ]]; then
+            echo "No session matching '$selector' found" >&2
+            exit 1
+        fi
+    else
+        echo "Invalid session selector: $selector" >&2
         exit 1
     fi
+
     echo "$entry"
 }
 
@@ -431,7 +678,7 @@ cmd_tail() {
     local entry
     entry=$(resolve_session "$sessions" "$session_num")
     IFS='|' read -r type file age mtime <<< "$entry"
-    extract_text "$type" "$file" | tail -"$n"
+    extract_tagged "$type" "$file" | tail -"$n" | style_lines
 }
 
 cmd_head() {
@@ -441,7 +688,7 @@ cmd_head() {
     local entry
     entry=$(resolve_session "$sessions" "$session_num")
     IFS='|' read -r type file age mtime <<< "$entry"
-    extract_text "$type" "$file" | head -"$n"
+    extract_tagged "$type" "$file" | head -"$n" | style_lines
 }
 
 main "$@"
